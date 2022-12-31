@@ -16,32 +16,57 @@ const TimestampLayout string = time.RFC3339
 // StandardVersion represents the current standard version being used by this library
 const StandardVersion string = "0.1"
 
+const (
+	// RoleAuthor is the role of a author.
+	RoleAuthor string = "author"
+
+	// RoleCosigner is the role of a author.
+	RoleCosigner string = "cosigner"
+)
+
 // CanaryClaim the claims that conform this canary
 type CanaryClaim struct {
-	Domain     string   `json:"domain"`
-	PublicKeys []string `json:"pubkeys"`
-	PanicKey   string   `json:"panickey"`
-	Version    string   `json:"version"`
-	Release    string   `json:"release"` // 2019-03-06T22:23:09.963
-	Expiry     string   `json:"expiry"`  // 2019-03-06T22:23:09.963
-	Freshness  string   `json:"freshness"`
-	Codes      []string `json:"codes"`
+
+	Domain     string      `json:"domain"`
+	MinSigners int         `json:"min_signers"`
+	PublicKeys []PublicKey `json:"pubkeys"`
+	PanicKey   string      `json:"panickey"`
+	Release    string      `json:"release"` // 2019-03-06T22:23:09.963
+	Expiry     string      `json:"expiry"`  // 2019-03-06T22:23:09.963
+	Freshness  string      `json:"freshness"`
+	Codes      []string    `json:"codes"`
+	Mirrors    []string    `json:"mirrors"`
 	IPNSKey    *string  `json:"ipns_key,omitempty"`
-}
 
 // CanarySignature we will keep this as a string for now, in the future it will support several signatures
 type CanarySignature string
 
 type CanarySignatureSet struct {
-	Domain     CanarySignature  `json:"domain"`
-	PublicKeys CanarySignature  `json:"pubkeys"`
-	PanicKey   CanarySignature  `json:"panickey"`
-	Version    CanarySignature  `json:"version"`
-	Release    CanarySignature  `json:"release"`
-	Expiry     CanarySignature  `json:"expiry"`
-	Freshness  CanarySignature  `json:"freshness"`
-	Codes      CanarySignature  `json:"codes"`
+
+	Domain     CanarySignature `json:"domain"`
+	MinSigners CanarySignature `json:"min_signers"`
+	PublicKeys CanarySignature `json:"pubkeys"`
+	PanicKey   CanarySignature `json:"panickey"`
+	Version    CanarySignature `json:"version"`
+	Release    CanarySignature `json:"release"`
+	Expiry     CanarySignature `json:"expiry"`
+	Freshness  CanarySignature `json:"freshness"`
+	Codes      CanarySignature `json:"codes"`
+	Mirrors    CanarySignature `json:"mirrors"`
 	IPNSKey    *CanarySignature `json:"ipns_key,omitempty"`
+
+}
+
+type PublicKey struct {
+	// Role is the role of the signer.
+	Role string `json:"role"`
+	// Name is the name of the signer.
+	Name string `json:"name"`
+	// Key is the public key
+	Key string `json:"key"`
+	// Required is true if required for verification.
+	Required bool `json:"required"`
+>>>>>>> dev -- Current Change
 }
 
 // StructToMap converts a struct to a map while maintaining the json alias as keys
@@ -83,7 +108,7 @@ func NewCanaryValidator(canary Canary) (validator *CanaryValidator) {
 	for _, pubKey := range canary.Claim.PublicKeys {
 		validator.Validators = append(validator.Validators, CanarySignatureValidator{
 			Canary:    canary,
-			PublicKey: pubKey,
+			PublicKey: pubKey.Key,
 		})
 	}
 	return
@@ -91,6 +116,23 @@ func NewCanaryValidator(canary Canary) (validator *CanaryValidator) {
 
 // Validate validates all the registered validators (one per public key in the canary plus the panic key)
 func (v *CanaryValidator) Validate() (bool, error) {
+	signedCount := 0 // Count of listed signers that signed.
+	for _, pubKey := range v.Canary.Claim.PublicKeys {
+		_, ok := v.Canary.Signatures[pubKey.Key]
+		if pubKey.Required && !ok {
+			return false, fmt.Errorf("required signature not found from the signer %q", pubKey.Name)
+		}
+		if ok {
+			signedCount++
+		}
+	}
+	// Checking for min signers.
+	// This only accounts for the listed signers.
+	if signedCount < v.Canary.Claim.MinSigners {
+		return false, fmt.Errorf("min signers criteria not met, required %d from the listed signers, got %d",
+			v.Canary.Claim.MinSigners, signedCount)
+	}
+
 	// check if the panic key has signed
 	if ok, _ := v.PanicValidator.Validate(); ok {
 		return false, fmt.Errorf("The panic key %s was used to sign the canary", v.PanicValidator.PublicKey)
@@ -125,6 +167,7 @@ func (v *CanarySignatureValidator) Validate() (bool, error) {
 
 // Canary represents a Canary, with its claims and its signature(s)
 type Canary struct {
+	Version    string                         `json:"version"`
 	Claim      CanaryClaim                    `json:"canary"`
 	Signatures map[string]*CanarySignatureSet `json:"signatures"` // the key of the map is the public key that signs the signature set
 }
@@ -160,13 +203,16 @@ func (c *Canary) Sign(privKey, pubKey []byte) (err error) {
 	if signatureSet.Domain, err = c.signField(c.Claim.Domain, privKey); err != nil {
 		return
 	}
+	if signatureSet.MinSigners, err = c.signField(c.Claim.MinSigners, privKey); err != nil {
+		return
+	}
 	if signatureSet.PublicKeys, err = c.signField(c.Claim.PublicKeys, privKey); err != nil {
 		return
 	}
 	if signatureSet.PanicKey, err = c.signField(c.Claim.PanicKey, privKey); err != nil {
 		return
 	}
-	if signatureSet.Version, err = c.signField(c.Claim.Version, privKey); err != nil {
+	if signatureSet.Version, err = c.signField(c.Version, privKey); err != nil {
 		return
 	}
 	if signatureSet.Release, err = c.signField(c.Claim.Release, privKey); err != nil {
@@ -181,13 +227,15 @@ func (c *Canary) Sign(privKey, pubKey []byte) (err error) {
 	if signatureSet.Codes, err = c.signField(c.Claim.Codes, privKey); err != nil {
 		return
 	}
+  	if signatureSet.Mirrors, err = c.signField(c.Claim.Mirrors, privKey); err != nil {
+		return
+	}
 	if c.Claim.IPNSKey != nil && *c.Claim.IPNSKey != "" {
 		ipnsKeySign, err := c.signField(*c.Claim.IPNSKey, privKey)
 		if err != nil {
 			return err
 		}
 		signatureSet.IPNSKey = &ipnsKeySign
-	}
 	return
 }
 
@@ -215,13 +263,16 @@ func (c *Canary) ValidateSignatures(pubKey []byte) bool {
 	if !c.validateSignature(c.Claim.Domain, signatureSet.Domain, pubKey) {
 		return false
 	}
+	if !c.validateSignature(c.Claim.MinSigners, signatureSet.MinSigners, pubKey) {
+		return false
+	}
 	if !c.validateSignature(c.Claim.PublicKeys, signatureSet.PublicKeys, pubKey) {
 		return false
 	}
 	if !c.validateSignature(c.Claim.PanicKey, signatureSet.PanicKey, pubKey) {
 		return false
 	}
-	if !c.validateSignature(c.Claim.Version, signatureSet.Version, pubKey) {
+	if !c.validateSignature(c.Version, signatureSet.Version, pubKey) {
 		return false
 	}
 	if !c.validateSignature(c.Claim.Release, signatureSet.Release, pubKey) {
@@ -234,6 +285,9 @@ func (c *Canary) ValidateSignatures(pubKey []byte) bool {
 		return false
 	}
 	if !c.validateSignature(c.Claim.Codes, signatureSet.Codes, pubKey) {
+		return false
+	}
+	if !c.validateSignature(c.Claim.Mirrors, signatureSet.Mirrors, pubKey) {
 		return false
 	}
 	return true

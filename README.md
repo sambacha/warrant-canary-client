@@ -1,17 +1,59 @@
 # CanaryTail CLI
 > CanaryTail CLI is a simple proof-of-concept implementation of the [CanaryTail standard](https://github.com/canarytail/standard)
 
+## How to use
+
+This assumes you have already downloaded or built the binary for canarytail. If you haven't, skip to [Installation](#installation).
+
+### Init
+
+Canarytail requires a place to store keys and the history of the canaries you generate or verify. Define this place automatically by initializing.
+
+`./canarytail init`
+
+### Create a signing key
+
+Canaries need to be signed by their author and associated with a specific website or project name, so you must tell canarytail the domain name of the website, or if you don't have publishing access to the domain's root folder (e.g. mydomain.com/canary.json), you can tell canarytail the name of the asset the canary is for instead.
+
+`./canarytail key new mydomain.com`
+
+`./canarytail key new myyoutubeaccount`
+
+### Generating the canary
+
+You can generate the canary by using the following:
+
+`./canarytail canary new mydomain.com`
+
+`./canarytail canary new myyoutubeaccount`
+
+
 ## Installation
+
+The steps below allow you to compile from the source code. If you prefer using an already pre-compiled binary, see the [releases](https://github.com/canarytail/client/releases) page.
 
 ### Windows:
 
-In PowerShell:
+In order to build in Windows, make sure you have `go` installed and the `GOPATH` set to its location.
 
+#### In PowerShell
+
+To build the binary for use **on Windows**:
 ```
-$Env:GOOS="linux"; $Env:GOARCH="amd64"; go build -o canarytail-linux-amd64 ./cmd/
-$Env:GOOS="darwin"; $Env:GOARCH="amd64"; go build -o canarytail-darwin-amd64 ./cmd/
 $Env:GOOS="windows"; $Env:GOARCH="amd64"; go build -o canarytail-windows-amd64.exe ./cmd/
 ```
+
+To build the binary for use **on Linux**:
+```
+$Env:GOOS="linux"; $Env:GOARCH="amd64"; go build -o canarytail-linux-amd64 ./cmd/
+```
+
+To build the binary for use **on Mac**:
+```
+$Env:GOOS="darwin"; $Env:GOARCH="amd64"; go build -o canarytail-darwin-amd64 ./cmd/
+```
+
+Now just run the `canarytail-dist-amd64` binary you built on whatever OS you built it for.
 
 ### OS X & Linux:
 
@@ -30,7 +72,10 @@ Build the project from the source folder for this canarytail client repo
  go build ./cmd/canarytail.go
 ```
 
-Run it via `./canarytail`, which should return:
+Run it via `./canarytail`
+
+
+### Command line arguments
 
 ```sh
 Usage: ./canarytail command [SUBCOMMAND] [OPTIONS]
@@ -55,7 +100,7 @@ Commands:
                               in $CANARY_HOME/DOMAIN, and saves to that same path.
 
                               Codes provided in OPTIONS will be removed from the canary,
-                              signifying that event has triggered the canary.
+                              signifying that event has tripped the canary.
 
       update DOMAIN [--OPTIONS]
                               Updates the existing canary named DOMAIN. If no OPTIONS
@@ -64,7 +109,7 @@ Commands:
                               (e.g. renewing for a month).
 
                               Codes provided in OPTIONS will be removed from the canary,
-                              signifying that event has triggered the canary.
+                              signifying that event has tripped the canary.
                               
 
       Valid OPTIONS:
@@ -94,7 +139,7 @@ Usage examples:
 New canary signing key               ./canarytail key new mydomain.com
 New canary with defaults             ./canarytail canary new mydomain.com      
 Renew existing canary 30 more days   ./canarytail canary update mydomain.com
-Trigger canary for warrant           ./canarytail canary update mydomain.com --WAR
+Trip canary for warrant              ./canarytail canary update mydomain.com --WAR
 Validate a canary on a site          ./canarytail canary validate https://mydomain.com/canary.json
 Validate a canary locally            ./canarytail canary validate ~/canary.json
 ```

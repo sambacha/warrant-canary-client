@@ -9,6 +9,11 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -36,6 +41,9 @@ var cli struct {
 		Update   canaryUpdateCmd   `cmd help:"Updates the existing canary named DOMAIN. If no OPTIONS are provided, it merely updates the signature date. If no EXPIRY is provided, it reuses the previous value (e.g. renewing for a month).  Codes provided in OPTIONS will be removed from the canary, signifying that event has triggered the canary."`
 		Panic    canaryPanicCmd    `cmd help:"Updates the existing canary named ALIAS. The canary is signed with the panic key, which will ensure the canary validation fails in all cases."`
 		Validate canaryValidateCmd `cmd help:"Validates a canary's signature"`
+		Sign     canarySignCmd     `cmd help:"Sign's a canary with keys stored in $CANARY_HOME/DOMAIN"`
+		Pubkey   canaryPubkeyCmd   `cmd help:"Print your public key for the domain. Use 'key new' command to create one if it does not exist."`
+		Mirrors  canaryMirrorsCmd  `cmd help:"Update mirrors in the canary. Use --add to add new mirrors, --delete to delete canaries. Without --add and --delete it will print the existing mirrors."`
 	} `cmd help:"This command is for manipulating canaries."`
 
 	Version versionCmd `cmd help:"Show version and exit"`
@@ -109,18 +117,19 @@ func (cmd *keyNewCmd) Run(ctx *context) error {
 
 type canaryOpCmd struct {
 	Domain string `arg name:"DOMAIN"`
-
-	Expiry  int    `name:"expiry" help:"Expires in # minutes from now (default: 43200, one month)" default:"43200"`
-	GAG     bool   `name:"GAG" help:"Gag order received"`
-	TRAP    bool   `name:"TRAP" help:"Trap and trace order received"`
-	DURESS  bool   `name:"DURESS" help:"Under duress (coercion, blackmail, etc)"`
-	XCRED   bool   `name:"XCRED" help:"Compromised credentials"`
-	XOPERS  bool   `name:"XOPERS" help:"Operations compromised"`
-	WAR     bool   `name:"WAR" help:"Warrant received"`
-	SUBP    bool   `name:"SUBP" help:"Subpoena received"`
-	CEASE   bool   `name:"CEASE" help:"Court order to cease operations"`
-	RAID    bool   `name:"RAID" help:"Raided, but data unlikely compromised"`
-	SEIZE   bool   `name:"SEIZE" help:"Hardware or data seized, unlikely compromised"`
+	Expiry     int      `name:"expiry" help:"Expires in # minutes from now (default: 43200, one month)" default:"43200"`
+	GAG        bool     `name:"GAG" help:"Gag order received"`
+	TRAP       bool     `name:"TRAP" help:"Trap and trace order received"`
+	DURESS     bool     `name:"DURESS" help:"Under duress (coercion, blackmail, etc)"`
+	XCRED      bool     `name:"XCRED" help:"Compromised credentials"`
+	XOPERS     bool     `name:"XOPERS" help:"Operations compromised"`
+	WAR        bool     `name:"WAR" help:"Warrant received"`
+	SUBP       bool     `name:"SUBP" help:"Subpoena received"`
+	CEASE      bool     `name:"CEASE" help:"Court order to cease operations"`
+	RAID       bool     `name:"RAID" help:"Raided, but data unlikely compromised"`
+	SEIZE      bool     `name:"SEIZE" help:"Hardware or data seized, unlikely compromised"`
+	MinSigners int      `name:"min-signers" help:"Minimum number of signers that are required to sign the canary for it to be valid (default and minimum allowed is 1)"`
+	Signers    []string `name:"signers" help:"List of all the signers that can sign this canary in the format 'name1:pubkey1,name2:pubkey2:required,name3:pubkey3,...'. Here the optional ':required' means that the signer is required to sign the canary. Mentioning author's public key is optional and should be used to only add a signer name to the author. Use this to also replace the list of signers."`
 	IPNSKey string `name:"ipns_key" help:"IPNS key where existing canaries are stored and new ones should be stored"`
 	IPFSURL string `name:"ipfs_url" help:"IPFS API URL to perform read/write operations"`
 }
@@ -183,18 +192,60 @@ func generateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 		return err
 	}
 
+	if cmd.MinSigners < 1 {
+		cmd.MinSigners = 1
+	}
+	canaryTime := time.Now()
+	authorKey := canarytail.FormatKey(publickKey)
 	// compose the canary
+  //
 	releaseTime := time.Now()
-	canary := &canarytail.Canary{Claim: canarytail.CanaryClaim{
-		Domain:     cmd.Domain,
-		Codes:      getCodes(cmd),
-		Release:    releaseTime.Format(canarytail.TimestampLayout),
-		Freshness:  canarytail.GetLastBlockChainBlockHashFormatted(),
-		Expiry:     releaseTime.Add(time.Duration(cmd.Expiry) * time.Minute).Format(canarytail.TimestampLayout),
-		Version:    canarytail.StandardVersion,
-		PublicKeys: []string{canarytail.FormatKey(publickKey)},
-		PanicKey:   canarytail.FormatKey(publicPanicKey),
-	}}
+	canary := &canarytail.Canary{
+		Version: canarytail.StandardVersion,
+		Claim: canarytail.CanaryClaim{
+			Domain:     cmd.Domain,
+			MinSigners: cmd.MinSigners,
+			Codes:      getCodes(cmd),
+			Release:    canaryTime.Format(canarytail.TimestampLayout),
+			Freshness:  canarytail.GetLastBlockChainBlockHashFormatted(),
+			Expiry:     canaryTime.Add(time.Duration(cmd.Expiry) * time.Minute).Format(canarytail.TimestampLayout),
+      Version:    canarytail.StandardVersion,
+      PanicKey:   canarytail.FormatKey(publicPanicKey),
+			PublicKeys: []canarytail.PublicKey{
+				{
+					Role:     canarytail.RoleAuthor,
+					Key:      authorKey,
+					Required: true,
+				},
+			},
+			PanicKey: canarytail.FormatKey(publicPanicKey),
+		},
+	}
+
+	signers, err := decodeSigners(cmd.Signers)
+	if err != nil {
+		return err
+	}
+	// If the 'signers' has the author, update the name of author.
+	for _, s := range signers {
+		if s.Key == authorKey {
+			// This is the author.
+			canary.Claim.PublicKeys[0].Name = s.Name
+			continue
+		}
+		canary.Claim.PublicKeys = append(canary.Claim.PublicKeys, s)
+	}
+	if canary.Claim.PublicKeys[0].Name == "" {
+		canary.Claim.PublicKeys[0].Name = canarytail.RoleAuthor
+	}
+
+	if len(canary.Claim.PublicKeys) < canary.Claim.MinSigners {
+		return fmt.Errorf(
+			"total number of signers should be at least min signers, min_signers=%d, total=%d",
+			canary.Claim.MinSigners, len(canary.Claim.PublicKeys),
+		)
+	}
+
 
 	h := cmd.IPNSKey
 	if h != "" {
@@ -214,10 +265,104 @@ func generateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 	}
 
 	// and print it
+	fileName := canaryFileName(canary.Claim.Domain, canaryTime)
+	latestFileName := canaryLatestFileName(canary.Claim.Domain)
 	canaryFormatted := canary.Format()
-	writeToFile(path.Join(dir, "canary.json"), canaryFormatted)
-	fmt.Println(canaryFormatted)
+	fp := path.Join(dir, fileName)
+	if err := writeToFile(fp, canaryFormatted); err != nil {
+		return err
+	}
+	fp = path.Join(dir, latestFileName)
+	if err := writeToFile(fp, canaryFormatted); err != nil {
+		return err
+	}
+
+	absFp, err := filepath.Abs(fp)
+	if err != nil {
+		absFp = fp
+	}
+	fmt.Printf("New canary has been stored at %q\n", absFp)
+	printNextSignerSuggestion(canary)
 	return nil
+}
+
+func decodeSigners(ss []string) ([]canarytail.PublicKey, error) {
+	signers := make(map[string]canarytail.PublicKey, len(ss))
+
+	for _, s := range ss {
+		parts := strings.Split(s, ":")
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("malformed signer, expected at least 2 ':' separated parts in %s", s)
+		}
+		if len(parts) > 3 {
+			return nil, fmt.Errorf("malformed signer, expected less than 3 ':' separated parts in %s", s)
+		}
+		if len(parts) == 3 && parts[2] != "required" {
+			return nil, fmt.Errorf("malformed signer, expected 'required' in the third part in %s", s)
+		}
+
+		if _, ok := signers[parts[0]]; ok {
+			return nil, fmt.Errorf("duplicate signer found with the name %s", parts[0])
+		}
+
+		signers[parts[0]] = canarytail.PublicKey{
+			Role:     canarytail.RoleCosigner,
+			Name:     parts[0],
+			Key:      parts[1],
+			Required: len(parts) == 3, // parts[2] is already checked above.
+		}
+	}
+
+	signerSlice := make([]canarytail.PublicKey, 0, len(signers))
+	for _, s := range signers {
+		signerSlice = append(signerSlice, s)
+	}
+
+	signerSlice = sortSigners(signerSlice)
+
+	return signerSlice, nil
+}
+
+func sortSigners(signers []canarytail.PublicKey) []canarytail.PublicKey {
+	// This sorting first groups the required and non-required together and
+	// sorts based on their signer name within the group.
+	sort.Slice(signers, func(i, j int) bool {
+		a, b := signers[i], signers[j]
+		if a.Required == b.Required {
+			return a.Name < b.Name
+		}
+		return a.Required
+	})
+
+	return signers
+}
+
+func printNextSignerSuggestion(c *canarytail.Canary) {
+	signCriteriaMet := len(c.Signatures) >= c.Claim.MinSigners
+	nextSigner := ""
+	for _, pubKey := range c.Claim.PublicKeys {
+		_, ok := c.Signatures[pubKey.Key]
+		if pubKey.Required && !ok {
+			signCriteriaMet = false
+		}
+		if nextSigner == "" && !ok {
+			nextSigner = pubKey.Name
+		}
+	}
+
+	if signCriteriaMet && nextSigner == "" {
+		// All signers are done.
+		fmt.Printf("Everyone has finished signing, please send the canary back to %s.\n", canarytail.RoleAuthor)
+	} else if signCriteriaMet && nextSigner != "" {
+		// Criteria met but signers are left.
+		fmt.Printf(
+			"Signing criteria has met. You can either send the canary back to %s, or send it to %q for further signing.\n",
+			canarytail.RoleAuthor, nextSigner,
+		)
+	} else {
+		// Criteria not met.
+		fmt.Printf("Please send the canary to %q for further signing.\n", nextSigner)
+	}
 }
 
 func updateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
@@ -269,7 +414,13 @@ func updateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 		return err
 	}
 
+	if cmd.MinSigners < 1 {
+		cmd.MinSigners = 1
+	}
+
 	// update the canary
+	canaryTime := time.Now()
+	canary.Claim.MinSigners = cmd.MinSigners
 	canary.Claim.Release = updateTime.Format(canarytail.TimestampLayout)
 	canary.Claim.Freshness = canarytail.GetLastBlockChainBlockHashFormatted()
 	canary.Claim.Expiry = updateTime.Add(time.Duration(cmd.Expiry) * time.Minute).Format(canarytail.TimestampLayout)
@@ -281,13 +432,18 @@ func updateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 	if publicKeyEnc != canary.Claim.PanicKey {
 		foundPubKey := false
 		for _, x := range canary.Claim.PublicKeys {
-			if x == publicKeyEnc {
+			if x.Key == publicKeyEnc {
 				foundPubKey = true
 				break
 			}
 		}
 		if !foundPubKey {
-			canary.Claim.PublicKeys = append(canary.Claim.PublicKeys, publicKeyEnc)
+			// First signers is the author.
+			canary.Claim.PublicKeys = append([]canarytail.PublicKey{{
+				Role:     canarytail.RoleAuthor,
+				Key:      publicKeyEnc,
+				Required: true,
+			}}, canary.Claim.PublicKeys...)
 		}
 	}
 
@@ -295,6 +451,37 @@ func updateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 	panicKeyEnc := canarytail.FormatKey(publicPanicKey)
 	if panicKeyEnc == publicKeyEnc && panicKeyEnc != canary.Claim.PanicKey {
 		return errors.New("The panic key does not match")
+	}
+
+	signers, err := decodeSigners(cmd.Signers)
+	if err != nil {
+		return err
+	}
+
+	if len(signers) != 0 {
+		// Since signers are being updated, we discard all the old signers except author.
+		// This allows editing old signers too.
+		canary.Claim.PublicKeys = canary.Claim.PublicKeys[:1]
+	}
+
+	// If the 'signers' has the author, update the name of author.
+	for _, s := range signers {
+		if s.Key == publicKeyEnc {
+			// This is the author.
+			canary.Claim.PublicKeys[0].Name = s.Name
+			continue
+		}
+		canary.Claim.PublicKeys = append(canary.Claim.PublicKeys, s)
+	}
+	if canary.Claim.PublicKeys[0].Name == "" {
+		canary.Claim.PublicKeys[0].Name = canarytail.RoleAuthor
+	}
+
+	if len(canary.Claim.PublicKeys) < canary.Claim.MinSigners {
+		return fmt.Errorf(
+			"total number of signers should be at least min signers, min_signers=%d, total=%d",
+			canary.Claim.MinSigners, len(canary.Claim.PublicKeys),
+		)
 	}
 
 	// sign it
@@ -311,8 +498,23 @@ func updateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 
 	// and print it
 	canaryFormatted := canary.Format()
-	writeToFile(path.Join(dir, "canary.json"), canaryFormatted)
-	fmt.Println(canaryFormatted)
+	newFileName := canaryFileName(canary.Claim.Domain, canaryTime)
+	latestFileName := canaryLatestFileName(canary.Claim.Domain)
+	fp := path.Join(dir, newFileName)
+	if err := writeToFile(fp, canaryFormatted); err != nil {
+		return err
+	}
+	fp = path.Join(dir, latestFileName)
+	if err := writeToFile(fp, canaryFormatted); err != nil {
+		return err
+	}
+
+	absFp, err := filepath.Abs(fp)
+	if err != nil {
+		absFp = fp
+	}
+	fmt.Printf("Updated canary has been stored at %q\n", absFp)
+	printNextSignerSuggestion(&canary)
 	return nil
 }
 
@@ -345,6 +547,25 @@ func (cmd *canaryPanicCmd) Run(ctx *context) error {
 	return updateCanary(cmd.canaryOpCmd, readPanicKeyPair)
 }
 
+type canaryPubkeyCmd struct {
+	Domain string `arg name:"DOMAIN"`
+}
+
+func (cmd *canaryPubkeyCmd) Run(ctx *context) error {
+	dir := canaryDirSafe(cmd.Domain)
+
+	// read the key pair for this canary alias
+	publickKey, err := readPublicKey(dir)
+	if err != nil {
+		fmt.Printf("Error when accessing public key for %q. Use 'key new %s' command to create a key if it does not exist.\n", cmd.Domain, cmd.Domain)
+		return err
+	}
+
+	key := canarytail.FormatKey(publickKey)
+	fmt.Printf("Your public key for %q is %q\n", cmd.Domain, key)
+	return nil
+}
+
 type canaryValidateCmd struct {
 	URI string `arg name:"uri"`
 }
@@ -362,6 +583,51 @@ func (cmd *canaryValidateCmd) Run(ctx *context) error {
 		return err
 	}
 	fmt.Println("OK!")
+	return nil
+}
+
+type canarySignCmd struct {
+	Path string `arg name:"canary_path"`
+}
+
+func (cmd *canarySignCmd) Run(ctx *context) error {
+	canary, err := canarytail.ReadFile(cmd.Path)
+	if err != nil {
+		return err
+	}
+	dir := canaryDirSafe(canary.Claim.Domain)
+
+	publicSigningKey, privateSigningKey, err := readKeyPair(dir)
+	if err != nil {
+		return err
+	}
+
+	// Check if signer exists in the list.
+	exists := false
+	pubKeyStr := canarytail.FormatKey(publicSigningKey)
+	for _, pk := range canary.Claim.PublicKeys {
+		if pk.Key == pubKeyStr {
+			exists = true
+			break
+		}
+	}
+	if !exists {
+		return fmt.Errorf("signer's public key not found in the list of signers")
+	}
+
+	fmt.Printf("Signing canary %v...\n", cmd.Path)
+
+	err = canary.Sign(privateSigningKey, publicSigningKey)
+	if err != nil {
+		return err
+	}
+
+	canaryFormatted := canary.Format()
+	if err := writeToFile(cmd.Path, canaryFormatted); err != nil {
+		return err
+	}
+
+	printNextSignerSuggestion(&canary)
 	return nil
 }
 
@@ -411,27 +677,45 @@ func writeToFile(path, contents string) error {
 }
 
 func readKeyPair(stagingPath string) (ed25519.PublicKey, ed25519.PrivateKey, error) {
-	publicKeyBytes, err := ioutil.ReadFile(path.Join(stagingPath, "public.b64"))
+	publicKey, err := readPublicKey(stagingPath)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	privateKeyBytes, err := ioutil.ReadFile(path.Join(stagingPath, "private.b64"))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	publicKey, err := base64.StdEncoding.DecodeString(string(publicKeyBytes))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	privateKey, err := base64.StdEncoding.DecodeString(string(privateKeyBytes))
+	privateKey, err := readPrivateKey(stagingPath)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	return publicKey, privateKey, nil
+}
+
+func readPublicKey(stagingPath string) (ed25519.PublicKey, error) {
+	publicKeyBytes, err := ioutil.ReadFile(path.Join(stagingPath, "public.b64"))
+	if err != nil {
+		return nil, err
+	}
+
+	publicKey, err := base64.StdEncoding.DecodeString(string(publicKeyBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	return publicKey, nil
+}
+
+func readPrivateKey(stagingPath string) (ed25519.PrivateKey, error) {
+	privateKeyBytes, err := ioutil.ReadFile(path.Join(stagingPath, "private.b64"))
+	if err != nil {
+		return nil, err
+	}
+
+	privateKey, err := base64.StdEncoding.DecodeString(string(privateKeyBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	return privateKey, nil
 }
 
 func readPanicKeyPair(stagingPath string) (ed25519.PublicKey, ed25519.PrivateKey, error) {
@@ -467,4 +751,198 @@ func readCanaryFile(path string) (canarytail.Canary, error) {
 	var canary canarytail.Canary
 	err = json.Unmarshal(canaryJSON, &canary)
 	return canary, err
+}
+
+const (
+	// canaryFileNameRegex matches strings like "canary.mydomain.com.1234567890.json"
+	canaryFileNameRegex            = `canary\..+\.\d+\.json`
+	canaryFileNameTimeCaptureRegex = `canary\..+\.(\d+)\.json`
+)
+
+var (
+	ErrCanaryNotFound = errors.New("canary not found")
+)
+
+func canaryFileName(domain string, t time.Time) string {
+	return fmt.Sprintf("canary.%s.%d.json", domain, t.UnixMilli())
+}
+
+func canaryLatestFileName(domain string) string {
+	return fmt.Sprintf("canary.%s.latest.json", domain)
+}
+
+func getLatestCanaryFileName(dir string) (fname string, err error) {
+	fnRegex, err := regexp.Compile(canaryFileNameRegex)
+	if err != nil {
+		return "", err
+	}
+	fnCaptureRegex, err := regexp.Compile(canaryFileNameTimeCaptureRegex)
+	if err != nil {
+		return "", err
+	}
+
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+
+	maxTs := -1
+	for i := 0; i < len(files); i++ {
+		if files[i].IsDir() {
+			continue
+		}
+		if !fnRegex.MatchString(files[i].Name()) {
+			continue
+		}
+
+		// If fnRegex matches, then fnCaptureRegex will always capture the timestamp.
+		match := fnCaptureRegex.FindStringSubmatch(files[i].Name())
+		ts, err := strconv.Atoi(match[1])
+		if err != nil {
+			continue
+		}
+
+		if ts > maxTs {
+			maxTs = ts
+			fname = files[i].Name()
+		}
+	}
+
+	if fname == "" {
+		return "", ErrCanaryNotFound
+	}
+
+	return fname, nil
+}
+
+type canaryMirrorsCmd struct {
+	Domain string   `arg name:"DOMAIN"`
+	Add    []string `name:"add" help:"Mirrors to add. Comma separated."`
+	Delete []string `name:"delete" help:"Mirrors to remove. Comma separated."`
+}
+
+func (cmd *canaryMirrorsCmd) Run(ctx *context) error {
+	return updateMirrorsIncanary(cmd.Domain, cmd.Add, cmd.Delete, readKeyPair)
+}
+
+func updateMirrorsIncanary(domain string, add, del []string, signingKeyPairReader keyPairReader) error {
+	dir := canaryDirSafe(domain)
+
+	fileName, err := getLatestCanaryFileName(dir)
+	if err != nil {
+		return err
+	}
+	canary, err := readCanaryFile(path.Join(dir, fileName))
+	if err != nil {
+		return err
+	}
+
+	if len(add) == 0 && len(del) == 0 {
+		fmt.Println("Mirrors:", canary.Claim.Mirrors)
+		return nil
+	}
+
+	// read the panic key pair for this canary alias
+	publicPanicKey, _, err := readPanicKeyPair(dir)
+	if err != nil {
+		return err
+	}
+
+	// read the key pair for this canary alias
+	publicSigningKey, privateSigningKey, err := signingKeyPairReader(dir)
+	if err != nil {
+		return err
+	}
+
+	// update the canary
+	canaryTime := time.Now()
+
+	// if the public key is not there, add it
+	publicKeyEnc := canarytail.FormatKey(publicSigningKey)
+	if publicKeyEnc != canary.Claim.PanicKey {
+		foundPubKey := false
+		for _, x := range canary.Claim.PublicKeys {
+			if x.Key == publicKeyEnc {
+				foundPubKey = true
+				break
+			}
+		}
+		if !foundPubKey {
+			// First signers is the author.
+			canary.Claim.PublicKeys = append([]canarytail.PublicKey{{
+				Role:     canarytail.RoleAuthor,
+				Key:      publicKeyEnc,
+				Required: true,
+			}}, canary.Claim.PublicKeys...)
+		}
+	}
+
+	// if the panic key is not the same, error out
+	panicKeyEnc := canarytail.FormatKey(publicPanicKey)
+	if panicKeyEnc == publicKeyEnc && panicKeyEnc != canary.Claim.PanicKey {
+		return errors.New("The panic key does not match")
+	}
+
+	// Update the mirrors.
+	var oldMirrors, newMirrors []string
+	newMirrorsMap := make(map[string]struct{})
+	for _, m := range canary.Claim.Mirrors {
+		oldMirrors = append(oldMirrors, m)
+		newMirrorsMap[m] = struct{}{}
+	}
+	for _, m := range add {
+		m = strings.TrimSpace(m)
+		newMirrorsMap[m] = struct{}{}
+	}
+	for _, m := range del {
+		m = strings.TrimSpace(m)
+		delete(newMirrorsMap, m)
+	}
+	for m, _ := range newMirrorsMap {
+		newMirrors = append(newMirrors, m)
+	}
+	sort.Strings(newMirrors)
+	if len(oldMirrors) == len(newMirrors) {
+		// Don't do anything if mirrors have not changed.
+		same := true
+		for i := range oldMirrors {
+			if oldMirrors[i] != newMirrors[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			fmt.Println("No mirrors changed. Existing mirrors:", canary.Claim.Mirrors)
+			return nil
+		}
+	}
+
+	canary.Claim.Mirrors = newMirrors
+
+	// sign it
+	err = canary.Sign(privateSigningKey, publicSigningKey)
+	if err != nil {
+		return err
+	}
+
+	// and print it
+	canaryFormatted := canary.Format()
+	newFileName := canaryFileName(canary.Claim.Domain, canaryTime)
+	latestFileName := canaryLatestFileName(canary.Claim.Domain)
+	fp := path.Join(dir, newFileName)
+	if err := writeToFile(fp, canaryFormatted); err != nil {
+		return err
+	}
+	fp = path.Join(dir, latestFileName)
+	if err := writeToFile(fp, canaryFormatted); err != nil {
+		return err
+	}
+
+	absFp, err := filepath.Abs(fp)
+	if err != nil {
+		absFp = fp
+	}
+	fmt.Println("Updated Mirrors:", canary.Claim.Mirrors)
+	fmt.Printf("Updated canary has been stored at %q\n", absFp)
+	return nil
 }

@@ -26,6 +26,7 @@ const (
 
 // CanaryClaim the claims that conform this canary
 type CanaryClaim struct {
+
 	Domain     string      `json:"domain"`
 	MinSigners int         `json:"min_signers"`
 	PublicKeys []PublicKey `json:"pubkeys"`
@@ -35,12 +36,13 @@ type CanaryClaim struct {
 	Freshness  string      `json:"freshness"`
 	Codes      []string    `json:"codes"`
 	Mirrors    []string    `json:"mirrors"`
-}
+	IPNSKey    *string  `json:"ipns_key,omitempty"`
 
 // CanarySignature we will keep this as a string for now, in the future it will support several signatures
 type CanarySignature string
 
 type CanarySignatureSet struct {
+
 	Domain     CanarySignature `json:"domain"`
 	MinSigners CanarySignature `json:"min_signers"`
 	PublicKeys CanarySignature `json:"pubkeys"`
@@ -51,6 +53,8 @@ type CanarySignatureSet struct {
 	Freshness  CanarySignature `json:"freshness"`
 	Codes      CanarySignature `json:"codes"`
 	Mirrors    CanarySignature `json:"mirrors"`
+	IPNSKey    *CanarySignature `json:"ipns_key,omitempty"`
+
 }
 
 type PublicKey struct {
@@ -62,6 +66,7 @@ type PublicKey struct {
 	Key string `json:"key"`
 	// Required is true if required for verification.
 	Required bool `json:"required"`
+>>>>>>> dev -- Current Change
 }
 
 // StructToMap converts a struct to a map while maintaining the json alias as keys
@@ -222,9 +227,15 @@ func (c *Canary) Sign(privKey, pubKey []byte) (err error) {
 	if signatureSet.Codes, err = c.signField(c.Claim.Codes, privKey); err != nil {
 		return
 	}
-	if signatureSet.Mirrors, err = c.signField(c.Claim.Mirrors, privKey); err != nil {
+  	if signatureSet.Mirrors, err = c.signField(c.Claim.Mirrors, privKey); err != nil {
 		return
 	}
+	if c.Claim.IPNSKey != nil && *c.Claim.IPNSKey != "" {
+		ipnsKeySign, err := c.signField(*c.Claim.IPNSKey, privKey)
+		if err != nil {
+			return err
+		}
+		signatureSet.IPNSKey = &ipnsKeySign
 	return
 }
 

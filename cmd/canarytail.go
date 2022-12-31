@@ -18,6 +18,7 @@ import (
 
 	"github.com/alecthomas/kong"
 	canarytail "github.com/canarytail/client"
+	"github.com/canarytail/client/ipfs"
 )
 
 const version = "0.1"
@@ -116,7 +117,6 @@ func (cmd *keyNewCmd) Run(ctx *context) error {
 
 type canaryOpCmd struct {
 	Domain string `arg name:"DOMAIN"`
-
 	Expiry     int      `name:"expiry" help:"Expires in # minutes from now (default: 43200, one month)" default:"43200"`
 	GAG        bool     `name:"GAG" help:"Gag order received"`
 	TRAP       bool     `name:"TRAP" help:"Trap and trace order received"`
@@ -130,6 +130,8 @@ type canaryOpCmd struct {
 	SEIZE      bool     `name:"SEIZE" help:"Hardware or data seized, unlikely compromised"`
 	MinSigners int      `name:"min-signers" help:"Minimum number of signers that are required to sign the canary for it to be valid (default and minimum allowed is 1)"`
 	Signers    []string `name:"signers" help:"List of all the signers that can sign this canary in the format 'name1:pubkey1,name2:pubkey2:required,name3:pubkey3,...'. Here the optional ':required' means that the signer is required to sign the canary. Mentioning author's public key is optional and should be used to only add a signer name to the author. Use this to also replace the list of signers."`
+	IPNSKey string `name:"ipns_key" help:"IPNS key where existing canaries are stored and new ones should be stored"`
+	IPFSURL string `name:"ipfs_url" help:"IPFS API URL to perform read/write operations"`
 }
 
 func getCodes(cmd canaryOpCmd) []string {
@@ -196,6 +198,8 @@ func generateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 	canaryTime := time.Now()
 	authorKey := canarytail.FormatKey(publickKey)
 	// compose the canary
+  //
+	releaseTime := time.Now()
 	canary := &canarytail.Canary{
 		Version: canarytail.StandardVersion,
 		Claim: canarytail.CanaryClaim{
@@ -205,6 +209,8 @@ func generateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 			Release:    canaryTime.Format(canarytail.TimestampLayout),
 			Freshness:  canarytail.GetLastBlockChainBlockHashFormatted(),
 			Expiry:     canaryTime.Add(time.Duration(cmd.Expiry) * time.Minute).Format(canarytail.TimestampLayout),
+      Version:    canarytail.StandardVersion,
+      PanicKey:   canarytail.FormatKey(publicPanicKey),
 			PublicKeys: []canarytail.PublicKey{
 				{
 					Role:     canarytail.RoleAuthor,
@@ -240,10 +246,22 @@ func generateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 		)
 	}
 
+
+	h := cmd.IPNSKey
+	if h != "" {
+		canary.Claim.IPNSKey = &h
+	}
+
 	// sign it
 	err = canary.Sign(privateSigningKey, publicSigningKey)
 	if err != nil {
 		return err
+	}
+
+	if canary.Claim.IPNSKey != nil && cmd.IPFSURL != "" {
+		if err := ipfs.StoreNewCanary(cmd.IPFSURL, canary, releaseTime); err != nil {
+			return fmt.Errorf("failed to write canary to IPFS: %s", err.Error())
+		}
 	}
 
 	// and print it
@@ -348,15 +366,40 @@ func printNextSignerSuggestion(c *canarytail.Canary) {
 }
 
 func updateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
-	dir := canaryDirSafe(cmd.Domain)
+	var (
+		dir        = canaryDirSafe(cmd.Domain)
+		fpath      = path.Join(dir, "canary.json")
+		updateTime = time.Now()
+		ipfsCanDir string
+	)
 
-	fileName, err := getLatestCanaryFileName(dir)
+	var canary canarytail.Canary
+	if cmd.IPFSURL != "" && cmd.IPNSKey != "" {
+		// IPNS info given. Get the canary from IPNS.
+		var err error
+		ipfsCanDir, err = ipfs.FetchCanariesToDisk(cmd.IPFSURL, cmd.IPNSKey, updateTime)
+		if err != nil {
+			return err
+		}
+
+		fname, err := ipfs.GetLatestCanary(ipfsCanDir)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Using the latest canary %s for the update\n", fname)
+
+		fpath = path.Join(ipfsCanDir, fname)
+	}
+
+	canary, err := readCanaryFile(fpath)
 	if err != nil {
 		return err
 	}
-	canary, err := readCanaryFile(path.Join(dir, fileName))
-	if err != nil {
-		return err
+	if canary.Claim.IPNSKey != nil && *canary.Claim.IPNSKey != "" {
+		if cmd.IPNSKey != *canary.Claim.IPNSKey {
+			return fmt.Errorf("mismatch in IPNS keys, CLI key=%s, canary key=%s", cmd.IPNSKey, *canary.Claim.IPNSKey)
+		}
 	}
 
 	// read the panic key pair for this canary alias
@@ -378,10 +421,10 @@ func updateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 	// update the canary
 	canaryTime := time.Now()
 	canary.Claim.MinSigners = cmd.MinSigners
-	canary.Claim.Release = canaryTime.Format(canarytail.TimestampLayout)
+	canary.Claim.Release = updateTime.Format(canarytail.TimestampLayout)
 	canary.Claim.Freshness = canarytail.GetLastBlockChainBlockHashFormatted()
-	canary.Claim.Expiry = canaryTime.Add(time.Duration(cmd.Expiry) * time.Minute).Format(canarytail.TimestampLayout)
-	canary.Version = canarytail.StandardVersion
+	canary.Claim.Expiry = updateTime.Add(time.Duration(cmd.Expiry) * time.Minute).Format(canarytail.TimestampLayout)
+	canary.Claim.Version = canarytail.StandardVersion
 	canary.Claim.Codes = getCodes(cmd)
 
 	// if the public key is not there, add it
@@ -445,6 +488,12 @@ func updateCanary(cmd canaryOpCmd, signingKeyPairReader keyPairReader) error {
 	err = canary.Sign(privateSigningKey, publicSigningKey)
 	if err != nil {
 		return err
+	}
+
+	if canary.Claim.IPNSKey != nil && cmd.IPFSURL != "" {
+		if err := ipfs.StoreCanaryInDir(cmd.IPFSURL, &canary, updateTime, ipfsCanDir); err != nil {
+			return fmt.Errorf("failed to write canary to IPFS: %s", err.Error())
+		}
 	}
 
 	// and print it
